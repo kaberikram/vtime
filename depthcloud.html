@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DepthCloud — M1</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ── Loading overlay ── */
+  #loader {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    transition: opacity 0.6s ease;
+  }
+  #loader.hidden { opacity: 0; pointer-events: none; }
+
+  .loader-title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #fff;
+  }
+
+  .loader-sub {
+    font-size: 12px;
+    color: rgba(255,255,255,0.4);
+    letter-spacing: 0.06em;
+    text-align: center;
+    max-width: 260px;
+    line-height: 1.6;
+  }
+
+  .progress-wrap {
+    width: 220px;
+    height: 2px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%;
+    background: rgba(255,255,255,0.7);
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.3s ease;
+  }
+
+  #status {
+    font-size: 11px;
+    color: rgba(255,255,255,0.3);
+    letter-spacing: 0.04em;
+    min-height: 16px;
+    text-align: center;
+  }
+
+  /* ── Main view ── */
+  #main {
+    display: none;
+    flex-direction: column;
+    width: 100vw;
+    height: 100vh;
+    align-items: center;
+    justify-content: center;
+  }
+  #main.visible { display: flex; }
+
+  /* Split view: webcam | depth */
+  .view-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    padding: 16px;
+    width: 100%;
+  }
+
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .panel-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.3);
+  }
+
+  canvas {
+    border-radius: 8px;
+    display: block;
+    background: #111;
+  }
+
+  /* FPS / perf badge */
+  #perf {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.25);
+    letter-spacing: 0.06em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Device badge */
+  #device-badge {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.2);
+    padding: 4px 10px;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 20px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Loading screen -->
+<div id="loader">
+  <div class="loader-title">DepthCloud</div>
+  <div class="progress-wrap"><div class="progress-bar" id="prog-bar"></div></div>
+  <div id="status">Initializing…</div>
+  <div class="loader-sub">
+    Depth Anything V2 · ~50 MB<br>cached after first load
+  </div>
+</div>
+
+<!-- Main split view -->
+<div id="main">
+  <div class="view-row">
+    <div class="panel">
+      <div class="panel-label">Camera</div>
+      <canvas id="cam-canvas"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-label">Depth</div>
+      <canvas id="depth-canvas"></canvas>
+    </div>
+  </div>
+</div>
+
+<div id="perf">— ms</div>
+<div id="device-badge">webgpu</div>
+
+<!-- Hidden webcam video element -->
+<video id="video" autoplay playsinline muted style="display:none"></video>
+
+<script type="module">
+// ── Constants ────────────────────────────────────────────────────────────────
+const DEPTH_CAPTURE_W  = 256;
+const DEPTH_CAPTURE_H  = 192;
+const DEPTH_MODEL_SIZE = 196;   // nearest multiple of 14 to 192 for ViT patch
+const INFER_COOLDOWN   = 25;    // ms between inference calls
+
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const loader     = document.getElementById('loader');
+const progBar    = document.getElementById('prog-bar');
+const statusEl   = document.getElementById('status');
+const mainEl     = document.getElementById('main');
+const perfEl     = document.getElementById('perf');
+const deviceBadge = document.getElementById('device-badge');
+const video      = document.getElementById('video');
+const camCanvas  = document.getElementById('cam-canvas');
+const depthCanvas = document.getElementById('depth-canvas');
+
+const camCtx   = camCanvas.getContext('2d');
+const depthCtx = depthCanvas.getContext('2d');
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let estimator   = null;
+let inferring   = false;
+let lastInfer   = 0;
+let frameCount  = 0;
+let lastFpsTime = performance.now();
+
+function setStatus(msg, pct) {
+  statusEl.textContent = msg;
+  if (pct !== undefined) progBar.style.width = pct + '%';
+}
+
+// ── 1. Webcam ─────────────────────────────────────────────────────────────────
+async function startCamera() {
+  setStatus('Requesting camera…', 10);
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user', frameRate: { ideal: 30 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise(res => { video.onloadedmetadata = res; });
+  await video.play();
+
+  // Match canvas sizes to camera AR, capped to viewport
+  const vw = Math.min(window.innerWidth / 2 - 40, 480);
+  const ratio = video.videoHeight / video.videoWidth;
+  const cw = Math.round(vw);
+  const ch = Math.round(vw * ratio);
+
+  [camCanvas, depthCanvas].forEach(c => { c.width = cw; c.height = ch; });
+  setStatus('Camera ready', 25);
+}
+
+// ── 2. Depth model ────────────────────────────────────────────────────────────
+async function loadDepthModel() {
+  setStatus('Loading Transformers.js…', 30);
+
+  // Lazy-import so the module only loads after camera check passes
+  const { pipeline, env } = await import(
+    'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.6.3/dist/transformers.min.js'
+  );
+
+  // Allow local model cache via IndexedDB
+  env.allowLocalModels = false;
+
+  let device = 'webgpu';
+  let dtype  = 'fp16';
+
+  // Check WebGPU availability
+  if (!navigator.gpu) {
+    console.warn('[DepthCloud] WebGPU not available — falling back to WASM/fp32');
+    device = 'wasm';
+    dtype  = 'fp32';
+  } else {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) throw new Error('No WebGPU adapter');
+    } catch (e) {
+      console.warn('[DepthCloud] WebGPU adapter failed:', e.message, '— falling back to WASM');
+      device = 'wasm';
+      dtype  = 'fp32';
+    }
+  }
+
+  deviceBadge.textContent = device === 'webgpu' ? 'webgpu · fp16' : 'wasm · fp32';
+
+  setStatus(`Downloading depth model (${device})…`, 40);
+
+  estimator = await pipeline(
+    'depth-estimation',
+    'onnx-community/depth-anything-v2-small',
+    {
+      device,
+      dtype,
+      progress_callback: (p) => {
+        if (p.status === 'downloading') {
+          const loaded  = p.loaded  ?? 0;
+          const total   = p.total   ?? 1;
+          const filePct = total > 0 ? loaded / total : 0;
+          // Map download progress to 40→90% of overall bar
+          const overall = 40 + filePct * 50;
+          const mb = (loaded / 1e6).toFixed(1);
+          const tb = (total  / 1e6).toFixed(1);
+          setStatus(`Downloading model… ${mb} / ${tb} MB`, overall);
+        } else if (p.status === 'loaded') {
+          setStatus('Model loaded', 92);
+        }
+      },
+    }
+  );
+
+  setStatus('Ready', 100);
+}
+
+// ── 3. Inference loop ─────────────────────────────────────────────────────────
+// Offscreen canvas for scaling video frame down before inference
+const inferCanvas = new OffscreenCanvas(DEPTH_MODEL_SIZE, DEPTH_MODEL_SIZE);
+const inferCtx    = inferCanvas.getContext('2d');
+
+async function runInference() {
+  if (inferring || video.readyState < 2) return;
+
+  const now = performance.now();
+  if (now - lastInfer < INFER_COOLDOWN) return;
+  lastInfer = now;
+  inferring = true;
+
+  try {
+    // Scale frame to model input size
+    inferCtx.drawImage(video, 0, 0, DEPTH_MODEL_SIZE, DEPTH_MODEL_SIZE);
+    const imageData = inferCtx.getImageData(0, 0, DEPTH_MODEL_SIZE, DEPTH_MODEL_SIZE);
+
+    // Run depth estimation — returns { depth: RawImage }
+    const result = await estimator(imageData);
+
+    // result.depth is a RawImage with .data (Float32Array or Uint8Array), .width, .height
+    const depthImg = result.depth;
+    renderDepth(depthImg);
+
+    const elapsed = performance.now() - now;
+    perfEl.textContent = `${elapsed.toFixed(0)} ms`;
+  } catch (e) {
+    console.error('[DepthCloud] inference error:', e);
+  } finally {
+    inferring = false;
+  }
+}
+
+// ── 4. Render helpers ─────────────────────────────────────────────────────────
+function renderCamFrame() {
+  camCtx.save();
+  // Mirror horizontally (front camera)
+  camCtx.translate(camCanvas.width, 0);
+  camCtx.scale(-1, 1);
+  camCtx.drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+  camCtx.restore();
+}
+
+function renderDepth(depthImg) {
+  // depthImg.data: typed array of depth values, normalized 0-1 (float) or 0-255 (uint8)
+  const w = depthImg.width;
+  const h = depthImg.height;
+  const src = depthImg.data;
+
+  // Detect value range
+  let maxVal = 1;
+  if (src instanceof Uint8Array || src instanceof Uint8ClampedArray) {
+    maxVal = 255;
+  }
+
+  // Write to a temporary ImageData then scale up to canvas
+  const tmpCanvas = new OffscreenCanvas(w, h);
+  const tmpCtx    = tmpCanvas.getContext('2d');
+  const imgData   = tmpCtx.createImageData(w, h);
+  const px = imgData.data;
+
+  for (let i = 0; i < w * h; i++) {
+    const v = Math.round((src[i] / maxVal) * 255);
+    px[i * 4 + 0] = v;
+    px[i * 4 + 1] = v;
+    px[i * 4 + 2] = v;
+    px[i * 4 + 3] = 255;
+  }
+  tmpCtx.putImageData(imgData, 0, 0);
+
+  // Scale to display canvas (crisp nearest-neighbor for depth map)
+  depthCtx.imageSmoothingEnabled = false;
+  depthCtx.drawImage(tmpCanvas, 0, 0, depthCanvas.width, depthCanvas.height);
+}
+
+// ── 5. Main rAF loop ──────────────────────────────────────────────────────────
+function loop() {
+  requestAnimationFrame(loop);
+  if (!estimator) return;
+
+  renderCamFrame();
+  runInference();   // async, fire-and-forget with cooldown guard
+
+  // FPS counter
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTime > 1000) {
+    // Could add FPS display here if needed
+    frameCount = 0;
+    lastFpsTime = now;
+  }
+}
+
+// ── 6. Boot ───────────────────────────────────────────────────────────────────
+async function boot() {
+  try {
+    await startCamera();
+    await loadDepthModel();
+
+    // Fade out loader, show main
+    setTimeout(() => {
+      loader.classList.add('hidden');
+      mainEl.classList.add('visible');
+      setTimeout(() => { loader.style.display = 'none'; }, 650);
+    }, 400);
+
+    loop();
+  } catch (e) {
+    setStatus('Error: ' + e.message, 0);
+    progBar.style.background = 'rgba(255,80,80,0.7)';
+    console.error('[DepthCloud] boot error:', e);
+  }
+}
+
+boot();
+</script>
+</body>
+</html>
