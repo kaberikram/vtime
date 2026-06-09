@@ -109,6 +109,11 @@
       <span class="ctrl-val" id="v-view">0.0</span>
     </div>
     <div class="ctrl-row">
+      <span class="ctrl-label">ROTATE</span>
+      <input type="range" id="s-rotate" min="0" max="100" value="50">
+      <span class="ctrl-val" id="v-rotate">0.0</span>
+    </div>
+    <div class="ctrl-row">
       <span class="ctrl-label">LINES</span>
       <input type="range" id="s-lines" min="0" max="100" value="60">
       <span class="ctrl-val" id="v-lines">0.6</span>
@@ -161,7 +166,7 @@ perspCam.position.z = 3;
 const vfxScene = new THREE.Scene();
 
 // ── controls ──────────────────────────────────────────────────────────────────
-const ctrl = { bloom: 0.8, depth: 1.5, cloud: 0.7, view: 0, scale: 1.0, segment: 0, lines: 0.6 };
+const ctrl = { bloom: 0.8, depth: 1.5, cloud: 0.7, view: 0, scale: 1.0, segment: 0, lines: 0.6, rotate: 0 };
 
 
 // ── pixel sampler ─────────────────────────────────────────────────────────────
@@ -361,6 +366,7 @@ function mkLine() {
   return {
     x:   -AR * 1.4,                               // spawn off left edge
     y:   (Math.random() - 0.5) * 2.6,
+    z:   -0.9 + Math.random() * 3.4,              // spread in depth: behind → in front of body
     len: 0.015 + Math.pow(Math.random(), 1.3) * 0.9, // bias toward short
     spd: 0.006 + Math.random() * 0.038,
     br:  0.3 + Math.random() * 0.7,               // per-line brightness
@@ -452,21 +458,30 @@ function update(dt) {
 
     const br = ln.br * ctrl.lines;
     // tail (dark → invisible with additive)
-    slPosArr[i*6+0] = ln.x;       slPosArr[i*6+1] = ln.y; slPosArr[i*6+2] = -0.3;
+    slPosArr[i*6+0] = ln.x;       slPosArr[i*6+1] = ln.y; slPosArr[i*6+2] = ln.z;
     slColArr[i*6+0] = 0;           slColArr[i*6+1] = 0;     slColArr[i*6+2] = 0;
     // head (bright blue-white)
-    slPosArr[i*6+3] = ln.x+ln.len; slPosArr[i*6+4] = ln.y; slPosArr[i*6+5] = -0.3;
+    slPosArr[i*6+3] = ln.x+ln.len; slPosArr[i*6+4] = ln.y; slPosArr[i*6+5] = ln.z;
     slColArr[i*6+3] = br * 0.65;   slColArr[i*6+4] = br * 0.82; slColArr[i*6+5] = br;
   }
   slPosAttr.needsUpdate = true;
   slColAttr.needsUpdate = true;
 
-  // Camera orbit arc: VIEW=0 → front-facing, VIEW=1 → top-down
-  const theta = ctrl.view * Math.PI * 0.5;
-  perspCam.position.y = lerp(perspCam.position.y, 3 * Math.sin(theta), 0.05);
-  perspCam.position.z = lerp(perspCam.position.z, 3 * Math.cos(theta), 0.05);
-  perspCam.rotation.y = lerp(perspCam.rotation.y, gyro.tx, 0.06);
-  perspCam.rotation.x = lerp(perspCam.rotation.x, -(theta + gyro.ty), 0.06);
+  // Spherical orbit around the subject:
+  //   VIEW   → theta (0 = front, 1 = top-down)
+  //   ROTATE → phi   (-1 = left profile, +1 = right profile)
+  const theta = ctrl.view   * Math.PI * 0.5;   //  0 .. π/2
+  const phi   = ctrl.rotate * Math.PI * 0.5;   // -π/2 .. π/2
+  const R     = 3;
+  const tgtX  = R * Math.cos(theta) * Math.sin(phi);
+  const tgtY  = R * Math.sin(theta);
+  const tgtZ  = R * Math.cos(theta) * Math.cos(phi);
+  perspCam.position.x = lerp(perspCam.position.x, tgtX, 0.06);
+  perspCam.position.y = lerp(perspCam.position.y, tgtY, 0.06);
+  perspCam.position.z = lerp(perspCam.position.z, tgtZ, 0.06);
+  perspCam.lookAt(0, 0, 0.4);          // aim at the body's depth midpoint
+  perspCam.rotateY(gyro.tx);           // gyro parallax as a small overlay
+  perspCam.rotateX(-gyro.ty);
 }
 
 let prevT = performance.now();
@@ -494,6 +509,7 @@ wire('s-bloom',   'v-bloom',   0,   2,   1, 'bloom');
 wire('s-cloud',   'v-cloud',   0,   1,   1, 'cloud');
 wire('s-depth',   'v-depth',   0,   3,   1, 'depth');
 wire('s-view',    'v-view',    0,   1,   1, 'view');
+wire('s-rotate',  'v-rotate', -1,   1,   1, 'rotate');
 wire('s-lines',   'v-lines',   0,   1,   1, 'lines');
 wire('s-scale',   'v-scale',   0.2, 1,   1, 'scale');
 wire('s-segment', 'v-segment', 0, 200,   0, 'segment');
