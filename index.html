@@ -108,6 +108,17 @@
       <input type="range" id="s-view" min="0" max="100" value="0">
       <span class="ctrl-val" id="v-view">0.0</span>
     </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">SCALE</span>
+      <input type="range" id="s-scale" min="0" max="100" value="100">
+      <span class="ctrl-val" id="v-scale">1.0</span>
+    </div>
+    <div class="ctrl-divider"></div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">SEGMENT</span>
+      <input type="range" id="s-segment" min="0" max="100" value="0">
+      <span class="ctrl-val" id="v-segment">0</span>
+    </div>
   </div>
 
   <script type="importmap">
@@ -145,20 +156,28 @@ perspCam.position.z = 3;
 const vfxScene = new THREE.Scene();
 
 // ── controls ──────────────────────────────────────────────────────────────────
-const ctrl = { bloom: 0.8, depth: 1.5, cloud: 0.7, view: 0 };
+const ctrl = { bloom: 0.8, depth: 1.5, cloud: 0.7, view: 0, scale: 1.0, segment: 0 };
 
 
 // ── pixel sampler ─────────────────────────────────────────────────────────────
 
+// ── silhouette segmentation texture ──────────────────────────────────────────
+// 80-column 1-row float texture: each texel = UV-Y of first dark pixel in that column
+const SIL_COLS = 80, SIL_ROWS = 80;
+const silData = new Float32Array(SIL_COLS);
+const silTex  = new THREE.DataTexture(silData, SIL_COLS, 1, THREE.RedFormat, THREE.FloatType);
+silTex.magFilter = THREE.LinearFilter;
+silTex.minFilter = THREE.LinearFilter;
+
 // ── shared video texture + uniforms ───────────────────────────────────────────
-// Created upfront with placeholder; swapped when camera activates
 const pcUniforms = {
-  videoTex:     { value: new THREE.Texture() },
-  vidAR:        { value: 1 },
-  scrAR:        { value: AR },
-  worldAR:      { value: AR },
-  zScale:       { value: ctrl.depth },
-  cloudOpacity: { value: ctrl.cloud },
+  videoTex:      { value: new THREE.Texture() },
+  vidAR:         { value: 1 },
+  scrAR:         { value: AR },
+  worldAR:       { value: AR },
+  zScale:        { value: ctrl.depth },
+  cloudOpacity:  { value: ctrl.cloud },
+  silhouetteTex: { value: silTex },
 };
 
 function initBg(videoEl) {
@@ -166,6 +185,29 @@ function initBg(videoEl) {
   vt.minFilter = THREE.LinearFilter;
   vt.magFilter = THREE.LinearFilter;
   pcUniforms.videoTex.value = vt;
+}
+
+const silCanvas = Object.assign(document.createElement('canvas'), { width: SIL_COLS, height: SIL_ROWS });
+const silCtx    = silCanvas.getContext('2d', { willReadFrequently: true });
+
+function scanSilhouette() {
+  if (!camEl.videoWidth) return;
+  silCtx.drawImage(camEl, 0, 0, SIL_COLS, SIL_ROWS);
+  const px     = silCtx.getImageData(0, 0, SIL_COLS, SIL_ROWS).data;
+  const thresh = ctrl.segment;
+  for (let col = 0; col < SIL_COLS; col++) {
+    silData[col] = 0;
+    if (thresh < 1) continue; // disabled — leave 0 so shader falls back to full depth
+    for (let row = 0; row < SIL_ROWS; row++) {
+      const i    = (row * SIL_COLS + col) << 2;
+      const luma = (px[i] * 299 + px[i+1] * 587 + px[i+2] * 114) / 1000;
+      if (luma < thresh) {
+        silData[col] = 1.0 - row / (SIL_ROWS - 1); // uv.y: 0=bottom, 1=top
+        break;
+      }
+    }
+  }
+  silTex.needsUpdate = true;
 }
 
 // ── point cloud ───────────────────────────────────────────────────────────────
@@ -195,10 +237,12 @@ const pcMat = new THREE.ShaderMaterial({
   depthWrite: false,
   vertexShader: `
     uniform sampler2D videoTex;
+    uniform sampler2D silhouetteTex;
     uniform float vidAR, scrAR, worldAR, zScale, stepU, stepV;
     varying float vDepth;
     varying float vEdge;
     varying vec2 vCorrUv;
+    varying float vBodyMask;
 
     // Sample video luma at UV with cover-fit correction
     float sampleL(vec2 uv) {
@@ -236,7 +280,14 @@ const pcMat = new THREE.ShaderMaterial({
       float gy = -tl - 2.*tc - tr + bl + 2.*bc + br;
       float edge = clamp(sqrt(gx*gx + gy*gy) * 4.0, 0.0, 1.0);
 
-      float depth = 1.0 - luma; // dark foreground = near
+      // Fake body segmentation — column scan silhouette
+      // silY = UV-Y of first dark pixel in this column (0 = none detected)
+      float silY     = texture2D(silhouetteTex, vec2(uv.x, 0.5)).r;
+      // bodyMask=1 inside body region; when silY=0 (disabled) fall back to full mask
+      float bodyMask = silY < 0.01 ? 1.0 : step(uv.y, silY);
+      vBodyMask = bodyMask;
+
+      float depth = (1.0 - luma) * mix(0.06, 1.0, bodyMask); // background nearly flat
       vDepth = depth;
       vEdge  = edge;
 
@@ -258,13 +309,11 @@ const pcMat = new THREE.ShaderMaterial({
     varying float vDepth;
     varying float vEdge;
     varying vec2 vCorrUv;
+    varying float vBodyMask;
 
     void main() {
-      // Sample real camera color at this particle's position
       vec3 col = texture2D(videoTex, vCorrUv).rgb;
       float luma = 0.299*col.r + 0.587*col.g + 0.114*col.b;
-      // With AdditiveBlending dark pixels add near-zero — but discard
-      // the very blackest to save overdraw on the empty background
       if (luma < 0.04) discard;
 
       vec2 c = gl_PointCoord * 2.0 - 1.0;
@@ -272,9 +321,10 @@ const pcMat = new THREE.ShaderMaterial({
       if (r > 1.0) discard;
       float soft = 1.0 - smoothstep(0.2, 1.0, r);
 
-      // Edge particles get a brightness boost for silhouette glow
-      vec3 finalCol = col * (1.0 + vEdge * 1.4);
-      gl_FragColor = vec4(finalCol, soft * cloudOpacity);
+      // Body: full brightness + edge glow  |  Background: dimmed, no glow
+      float brightness = mix(0.25, 1.0, vBodyMask);
+      vec3 finalCol    = col * brightness * (1.0 + vEdge * 1.4 * vBodyMask);
+      gl_FragColor     = vec4(finalCol, soft * cloudOpacity);
     }
   `,
 });
@@ -348,9 +398,12 @@ function update(dt) {
   pcUniforms.zScale.value       = ctrl.depth;
   pcUniforms.cloudOpacity.value = ctrl.cloud;
 
-  if (frameN % 5 === 0 && camEl.videoWidth) {
+  if (frameN % 3 === 0 && camEl.videoWidth) {
     pcUniforms.vidAR.value = camEl.videoWidth / camEl.videoHeight;
+    scanSilhouette();
   }
+
+  pointCloud.scale.setScalar(ctrl.scale);
 
   // Camera orbit arc: VIEW=0 → front-facing, VIEW=1 → top-down
   const theta = ctrl.view * Math.PI * 0.5;
@@ -381,10 +434,12 @@ function wire(id, valId, min, max, dec, key) {
     vl.textContent = dec === 0 ? Math.round(v) : v.toFixed(dec);
   });
 }
-wire('s-bloom',  'v-bloom',  0,   2,   1, 'bloom');
-wire('s-cloud',  'v-cloud',  0,   1,   1, 'cloud');
-wire('s-depth',  'v-depth',  0,   3,   1, 'depth');
-wire('s-view',   'v-view',   0,   1,   1, 'view');
+wire('s-bloom',   'v-bloom',   0,   2,   1, 'bloom');
+wire('s-cloud',   'v-cloud',   0,   1,   1, 'cloud');
+wire('s-depth',   'v-depth',   0,   3,   1, 'depth');
+wire('s-view',    'v-view',    0,   1,   1, 'view');
+wire('s-scale',   'v-scale',   0.2, 1,   1, 'scale');
+wire('s-segment', 'v-segment', 0, 200,   0, 'segment');
 
 // ── panel toggle ──────────────────────────────────────────────────────────────
 const panel = document.getElementById('panel');
