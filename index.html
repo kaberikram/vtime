@@ -94,17 +94,6 @@
       <span class="ctrl-val" id="v-bloom">0.8</span>
     </div>
     <div class="ctrl-row">
-      <span class="ctrl-label">RAYS</span>
-      <input type="range" id="s-rays" min="0" max="100" value="60">
-      <span class="ctrl-val" id="v-rays">0.6</span>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">BEAMS</span>
-      <input type="range" id="s-beams" min="0" max="100" value="50">
-      <span class="ctrl-val" id="v-beams">0.5</span>
-    </div>
-    <div class="ctrl-divider"></div>
-    <div class="ctrl-row">
       <span class="ctrl-label">CLOUD</span>
       <input type="range" id="s-cloud" min="0" max="100" value="70">
       <span class="ctrl-val" id="v-cloud">0.7</span>
@@ -118,17 +107,6 @@
       <span class="ctrl-label">VIEW</span>
       <input type="range" id="s-view" min="0" max="100" value="0">
       <span class="ctrl-val" id="v-view">0.0</span>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">HAZE</span>
-      <input type="range" id="s-haze" min="0" max="100" value="30">
-      <span class="ctrl-val" id="v-haze">0.3</span>
-    </div>
-    <div class="ctrl-divider"></div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">DETECT</span>
-      <input type="range" id="s-detect" min="0" max="100" value="55">
-      <span class="ctrl-val" id="v-detect">170</span>
     </div>
   </div>
 
@@ -156,10 +134,6 @@ renderer.autoClear = false;
 document.body.appendChild(renderer.domElement);
 
 // ── cameras ───────────────────────────────────────────────────────────────────
-// Ortho for flat video bg
-const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 10);
-orthoCam.position.z = 5;
-
 // Perspective for VFX — fov chosen so world ±1 = screen edge in Y at z=0
 // tan(fov/2) = 1/3  →  fov ≈ 36.87°
 const FOV_DEG  = 2 * Math.atan(1 / 3) * (180 / Math.PI);
@@ -168,105 +142,13 @@ const perspCam = new THREE.PerspectiveCamera(FOV_DEG, AR, 0.01, 20);
 perspCam.position.z = 3;
 
 // ── scenes ────────────────────────────────────────────────────────────────────
-const bgScene  = new THREE.Scene();
 const vfxScene = new THREE.Scene();
 
 // ── controls ──────────────────────────────────────────────────────────────────
-const ctrl = { bloom: 0.8, rays: 0.6, beams: 0.5, haze: 0.3, detect: 170, depth: 1.5, cloud: 0.7, view: 0 };
+const ctrl = { bloom: 0.8, depth: 1.5, cloud: 0.7, view: 0 };
 
-// ── coordinate helpers ────────────────────────────────────────────────────────
-// Convert normalised source position (0..1) to perspective world coords
-const ndc  = v => (v - 0.5) * 2;          // 0..1 → -1..1
-const wx   = v => ndc(v) * AR;            // world X (accounts for aspect)
-const wy   = v => ndc(v);                 // world Y
 
 // ── pixel sampler ─────────────────────────────────────────────────────────────
-const SW = 80, SH = 80;
-const offCanvas = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
-const offCtx    = offCanvas.getContext('2d', { willReadFrequently: true });
-const MAX_SRCS  = 6;
-
-let sources   = [];
-let darks     = [];
-let silhouette = new Float32Array(SW); // Y per column, 0..1 (Three.js up)
-
-function sampleFrame(video) {
-  if (!video.videoWidth) return;
-  offCtx.drawImage(video, 0, 0, SW, SH);
-  const px = offCtx.getImageData(0, 0, SW, SH).data;
-
-  // 8×8 grid — light source detection
-  const GCOLS = 8, GROWS = 8, GCW = SW / GCOLS, GCH = SH / GROWS;
-  const cells = [];
-  for (let row = 0; row < GROWS; row++) {
-    for (let col = 0; col < GCOLS; col++) {
-      let maxL = 0, wx2 = 0, wy2 = 0, wt = 0;
-      const x0 = col * GCW | 0, x1 = Math.min(((col + 1) * GCW) | 0, SW);
-      const y0 = row * GCH | 0, y1 = Math.min(((row + 1) * GCH) | 0, SH);
-      for (let py = y0; py < y1; py++) {
-        for (let px2 = x0; px2 < x1; px2++) {
-          const i = (py * SW + px2) << 2;
-          const L = (77 * px[i] + 150 * px[i + 1] + 29 * px[i + 2]) >> 8;
-          if (L > maxL) maxL = L;
-          if (L > ctrl.detect) { wx2 += px2 * L; wy2 += py * L; wt += L; }
-        }
-      }
-      cells.push({
-        maxL,
-        nx: wt > 0 ? wx2 / wt / SW : (col + 0.5) / GCOLS,
-        ny: wt > 0 ? 1 - wy2 / wt / SH : 1 - (row + 0.5) / GROWS,
-      });
-    }
-  }
-  cells.sort((a, b) => b.maxL - a.maxL);
-  sources = cells.filter(c => c.maxL >= ctrl.detect).slice(0, MAX_SRCS)
-                 .map(c => ({ nx: c.nx, ny: c.ny, str: c.maxL / 255 }));
-  darks   = cells.filter(c => c.maxL < 45).map(c => ({ nx: c.nx, ny: c.ny }));
-
-  // Column top-scan — silhouette horizon
-  const darkThresh = (ctrl.detect * 0.65) | 0;
-  for (let col = 0; col < SW; col++) {
-    silhouette[col] = -1; // sentinel: no edge found
-    for (let row = 0; row < SH; row++) {
-      const i = (row * SW + col) << 2;
-      const L = (77 * px[i] + 150 * px[i + 1] + 29 * px[i + 2]) >> 8;
-      if (L < darkThresh) { silhouette[col] = 1 - row / (SH - 1); break; }
-    }
-  }
-}
-
-// ── texture builders ──────────────────────────────────────────────────────────
-function mkRadialTex(size, stops) {
-  const c = Object.assign(document.createElement('canvas'), { width: size, height: size });
-  const ctx = c.getContext('2d');
-  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-  stops.forEach(([t, col]) => g.addColorStop(t, col));
-  ctx.fillStyle = g; ctx.fillRect(0, 0, size, size);
-  return new THREE.CanvasTexture(c);
-}
-function mkLinearTex(w, h, x0, y0, x1, y1, stops) {
-  const c = Object.assign(document.createElement('canvas'), { width: w, height: h });
-  const ctx = c.getContext('2d');
-  const g = ctx.createLinearGradient(x0, y0, x1, y1);
-  stops.forEach(([t, col]) => g.addColorStop(t, col));
-  ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
-  return new THREE.CanvasTexture(c);
-}
-
-const glowTex = mkRadialTex(256, [
-  [0,    'rgba(255,245,220,1)'],
-  [0.10, 'rgba(255,220,140,0.9)'],
-  [0.30, 'rgba(160,200,255,0.45)'],
-  [0.65, 'rgba(70,110,255,0.08)'],
-  [1,    'rgba(0,0,0,0)'],
-]);
-const shaftTex = mkLinearTex(16, 512, 0, 256, 0, 0, [
-  [0,    'rgba(100,180,255,0)'],
-  [0.38, 'rgba(200,225,255,0.35)'],
-  [0.50, 'rgba(255,255,255,1)'],
-  [0.62, 'rgba(200,225,255,0.35)'],
-  [1,    'rgba(100,180,255,0)'],
-]);
 
 // ── shared video texture + uniforms ───────────────────────────────────────────
 // Created upfront with placeholder; swapped when camera activates
@@ -279,27 +161,11 @@ const pcUniforms = {
   cloudOpacity: { value: ctrl.cloud },
 };
 
-let bgUniforms = null;
-
 function initBg(videoEl) {
   const vt = new THREE.VideoTexture(videoEl);
   vt.minFilter = THREE.LinearFilter;
   vt.magFilter = THREE.LinearFilter;
-
-  bgUniforms = { map: { value: vt }, scrAR: { value: AR }, vidAR: { value: 1 } };
-  bgScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
-    uniforms: bgUniforms, depthWrite: false,
-    vertexShader:   `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }`,
-    fragmentShader: `
-      uniform sampler2D map; uniform float scrAR,vidAR; varying vec2 vUv;
-      void main(){
-        vec2 uv=vUv; float r=vidAR/scrAR;
-        if(r>1.0) uv.x=(uv.x-.5)/r+.5; else uv.y=(uv.y-.5)*r+.5;
-        gl_FragColor=vec4(texture2D(map,uv).rgb*0.65,1.);
-      }`,
-  })));
-
-  pcUniforms.videoTex.value = vt; // share same VideoTexture
+  pcUniforms.videoTex.value = vt;
 }
 
 // ── point cloud ───────────────────────────────────────────────────────────────
@@ -417,75 +283,6 @@ const pointCloud = new THREE.Points(pcGeo, pcMat);
 pointCloud.frustumCulled = false;
 vfxScene.add(pointCloud);
 
-// ── silhouette horizon line ───────────────────────────────────────────────────
-const horizonBuf = new Float32Array(SW * 3);
-const horizonGeo = new THREE.BufferGeometry();
-horizonGeo.setAttribute('position', new THREE.BufferAttribute(horizonBuf, 3));
-const horizonLine = new THREE.Line(horizonGeo, new THREE.LineBasicMaterial({
-  color: 0x33aaff, blending: THREE.AdditiveBlending,
-  transparent: true, opacity: 0.5, depthWrite: false,
-}));
-vfxScene.add(horizonLine);
-
-// ── glow sprites ──────────────────────────────────────────────────────────────
-const glows = Array.from({ length: MAX_SRCS }, () => {
-  const s = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: glowTex, blending: THREE.AdditiveBlending,
-    transparent: true, opacity: 0, depthWrite: false,
-  }));
-  s.scale.setScalar(0.5); s.position.set(0, -5, 2);
-  vfxScene.add(s); return s;
-});
-
-// ── shaft sprites ─────────────────────────────────────────────────────────────
-const N_SHAFTS  = 7;
-const shaftData = Array.from({ length: MAX_SRCS }, () => {
-  const grp = new THREE.Group(); grp.position.set(0, -5, 1.5);
-  const shafts = Array.from({ length: N_SHAFTS }, (_, j) => {
-    const baseAngle = (j / N_SHAFTS) * Math.PI;
-    const len       = 0.28 + Math.random() * 0.30;
-    const mat = new THREE.SpriteMaterial({
-      map: shaftTex, blending: THREE.AdditiveBlending,
-      transparent: true, opacity: 0, depthWrite: false, rotation: baseAngle,
-    });
-    const sp = new THREE.Sprite(mat); sp.scale.set(0.02, len, 1); grp.add(sp);
-    return { sp, baseAngle, len };
-  });
-  vfxScene.add(grp); return { grp, shafts };
-});
-
-// ── connector beams ───────────────────────────────────────────────────────────
-const MAX_BEAMS = 4;
-const beams = Array.from({ length: MAX_BEAMS }, () => {
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-  const mat = new THREE.LineBasicMaterial({
-    color: 0x88ccff, blending: THREE.AdditiveBlending,
-    transparent: true, opacity: 0, depthWrite: false,
-  });
-  const line = new THREE.Line(geo, mat); vfxScene.add(line); return { line, geo };
-});
-
-// ── haze particles (3-D) ──────────────────────────────────────────────────────
-const N_HAZE = 350;
-const hPos = new Float32Array(N_HAZE * 3);
-const hVel = new Float32Array(N_HAZE * 3);
-for (let i = 0; i < N_HAZE; i++) {
-  hPos[i*3]   = (Math.random() - 0.5) * 2 * AR;
-  hPos[i*3+1] = (Math.random() - 0.5) * 2;
-  hPos[i*3+2] = Math.random() * 1.4;
-  hVel[i*3]   = (Math.random() - 0.5) * 0.0012;
-  hVel[i*3+1] = (Math.random() * 0.7 + 0.3) * 0.0007;
-  hVel[i*3+2] = (Math.random() - 0.5) * 0.0004;
-}
-const hazeGeo = new THREE.BufferGeometry();
-hazeGeo.setAttribute('position', new THREE.BufferAttribute(hPos, 3));
-const hazeMat = new THREE.PointsMaterial({
-  color: 0x5588ff, size: 0.018, sizeAttenuation: true,
-  blending: THREE.AdditiveBlending, transparent: true, opacity: ctrl.haze, depthWrite: false,
-});
-vfxScene.add(new THREE.Points(hazeGeo, hazeMat));
-
 // ── gyroscope parallax ────────────────────────────────────────────────────────
 const gyro = { tx: 0, ty: 0, baseB: null, baseG: null };
 
@@ -536,7 +333,6 @@ window.addEventListener('resize', () => {
   perspCam.aspect = AR; perspCam.updateProjectionMatrix();
   pcUniforms.scrAR.value   = AR;
   pcUniforms.worldAR.value = AR;
-  if (bgUniforms) bgUniforms.scrAR.value = AR;
 });
 
 // ── update loop ───────────────────────────────────────────────────────────────
@@ -549,17 +345,11 @@ function update(dt) {
   frameN += 1;
 
   bloomPass.strength            = ctrl.bloom;
-  hazeMat.opacity               = ctrl.haze;
   pcUniforms.zScale.value       = ctrl.depth;
   pcUniforms.cloudOpacity.value = ctrl.cloud;
 
-  if (frameN % 5 === 0) {
-    sampleFrame(camEl);
-    if (bgUniforms && camEl.videoWidth) {
-      const va = camEl.videoWidth / camEl.videoHeight;
-      bgUniforms.vidAR.value = va;
-      pcUniforms.vidAR.value = va;
-    }
+  if (frameN % 5 === 0 && camEl.videoWidth) {
+    pcUniforms.vidAR.value = camEl.videoWidth / camEl.videoHeight;
   }
 
   // Camera orbit arc: VIEW=0 → front-facing, VIEW=1 → top-down
@@ -568,78 +358,6 @@ function update(dt) {
   perspCam.position.z = lerp(perspCam.position.z, 3 * Math.cos(theta), 0.05);
   perspCam.rotation.y = lerp(perspCam.rotation.y, gyro.tx, 0.06);
   perspCam.rotation.x = lerp(perspCam.rotation.x, -(theta + gyro.ty), 0.06);
-
-  // Silhouette horizon line
-  for (let col = 0; col < SW; col++) {
-    const sx = silhouette[col];
-    horizonBuf[col * 3]     = ((col / (SW - 1)) * 2 - 1) * AR;
-    horizonBuf[col * 3 + 1] = sx >= 0 ? sx * 2 - 1 : -5; // hide if no edge
-    horizonBuf[col * 3 + 2] = 0.2;
-  }
-  horizonGeo.attributes.position.needsUpdate = true;
-
-  // Glows + shafts
-  for (let i = 0; i < MAX_SRCS; i++) {
-    const src  = sources[i];
-    const glow = glows[i];
-    const { grp, shafts } = shaftData[i];
-
-    if (src) {
-      const tx    = wx(src.nx), ty = wy(src.ny);
-      const pulse = 0.84 + 0.16 * Math.sin(time * 2.4 + i * 1.9);
-
-      glow.position.x = lerp(glow.position.x, tx, 0.13);
-      glow.position.y = lerp(glow.position.y, ty, 0.13);
-      glow.material.opacity = src.str * pulse * 0.92;
-      glow.scale.setScalar((0.30 + src.str * 0.35) * AR);
-
-      grp.position.x = lerp(grp.position.x, tx, 0.13);
-      grp.position.y = lerp(grp.position.y, ty, 0.13);
-      shafts.forEach(({ sp, baseAngle, len }, j) => {
-        sp.material.rotation = baseAngle + time * (0.06 + j * 0.015);
-        sp.material.opacity  = src.str * (0.28 + 0.10 * Math.sin(time * 2.8 + j * 1.3)) * pulse * ctrl.rays;
-      });
-    } else {
-      glow.material.opacity *= 0.87;
-      shaftData[i].shafts.forEach(({ sp }) => { sp.material.opacity *= 0.87; });
-    }
-  }
-
-  // Connector beams
-  let bi = 0;
-  done: for (let i = 0; i < sources.length; i++) {
-    for (let j = i + 1; j < sources.length; j++) {
-      if (bi >= MAX_BEAMS) break done;
-      const a = sources[i], b = sources[j];
-      const pos = beams[bi].geo.attributes.position;
-      pos.setXYZ(0, wx(a.nx), wy(a.ny), 0);
-      pos.setXYZ(1, wx(b.nx), wy(b.ny), 0);
-      pos.needsUpdate = true;
-      const p = 0.5 + 0.5 * Math.sin(time * 4.5 + bi * 2.3);
-      beams[bi].line.material.opacity = (a.str + b.str) * 0.32 * p * ctrl.beams;
-      beams[bi].line.material.color.setHSL(0.53 + 0.10 * Math.sin(time * 0.25 + bi), 1, 0.75);
-      bi++;
-    }
-  }
-  for (let i = bi; i < MAX_BEAMS; i++) beams[i].line.material.opacity *= 0.88;
-
-  // Haze
-  for (let i = 0; i < N_HAZE; i++) {
-    hPos[i*3]   += hVel[i*3];
-    hPos[i*3+1] += hVel[i*3+1];
-    hPos[i*3+2] += hVel[i*3+2];
-    if (hPos[i*3+1] > 1.15) {
-      hPos[i*3+1] = -1.15;
-      hPos[i*3+2] = Math.random() * 1.3;
-      hPos[i*3]   = darks.length
-        ? (darks[Math.floor(Math.random() * darks.length)].nx * 2 - 1) * AR + (Math.random() - 0.5) * 0.3
-        : (Math.random() - 0.5) * 2 * AR;
-    }
-    if (hPos[i*3] >  AR * 1.1) hPos[i*3] = -AR * 1.1;
-    if (hPos[i*3] < -AR * 1.1) hPos[i*3] =  AR * 1.1;
-    hPos[i*3+2] = Math.max(0, Math.min(1.5, hPos[i*3+2]));
-  }
-  hazeGeo.attributes.position.needsUpdate = true;
 }
 
 let prevT = performance.now();
@@ -664,13 +382,9 @@ function wire(id, valId, min, max, dec, key) {
   });
 }
 wire('s-bloom',  'v-bloom',  0,   2,   1, 'bloom');
-wire('s-rays',   'v-rays',   0,   1,   1, 'rays');
-wire('s-beams',  'v-beams',  0,   1,   1, 'beams');
 wire('s-cloud',  'v-cloud',  0,   1,   1, 'cloud');
 wire('s-depth',  'v-depth',  0,   3,   1, 'depth');
 wire('s-view',   'v-view',   0,   1,   1, 'view');
-wire('s-haze',   'v-haze',   0,   1,   1, 'haze');
-wire('s-detect', 'v-detect', 80, 230,  0, 'detect');
 
 // ── panel toggle ──────────────────────────────────────────────────────────────
 const panel = document.getElementById('panel');
