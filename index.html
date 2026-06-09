@@ -299,7 +299,7 @@ function initBg(videoEl) {
 
 // ── point cloud ───────────────────────────────────────────────────────────────
 // Grid stored as UV coords in XY (0..1); vertex shader computes world pos + Z from luma
-const PC_COLS = 55, PC_ROWS = 90;
+const PC_COLS = 160, PC_ROWS = 120;
 const pcCount = PC_COLS * PC_ROWS;
 const pcPosArr = new Float32Array(pcCount * 3);
 for (let row = 0; row < PC_ROWS; row++) {
@@ -327,6 +327,7 @@ const pcMat = new THREE.ShaderMaterial({
     uniform float vidAR, scrAR, worldAR, zScale, stepU, stepV;
     varying float vDepth;
     varying float vEdge;
+    varying vec2 vCorrUv;
 
     // Sample video luma at UV with cover-fit correction
     float sampleL(vec2 uv) {
@@ -341,6 +342,14 @@ const pcMat = new THREE.ShaderMaterial({
 
     void main() {
       vec2 uv = position.xy; // grid UV stored in XY
+
+      // Cover-fit corrected UV — passed to fragment for camera color sampling
+      vec2 corrUv = uv;
+      float ar = vidAR / scrAR;
+      if (ar > 1.0) corrUv.x = (corrUv.x - 0.5) / ar + 0.5;
+      else          corrUv.y = (corrUv.y - 0.5) * ar + 0.5;
+      vCorrUv = clamp(corrUv, 0.001, 0.999);
+
       float luma = sampleL(uv);
 
       // Sobel edge detection over one grid-cell neighbourhood
@@ -369,28 +378,32 @@ const pcMat = new THREE.ShaderMaterial({
       vec4 mvPos    = modelViewMatrix * vec4(pos, 1.0);
       gl_Position   = projectionMatrix * mvPos;
       float dist    = max(-mvPos.z, 0.1);
-      gl_PointSize  = clamp((depth * 3.0 + edge * 2.5 + 0.2) * 200.0 / dist, 0.4, 8.0);
+      gl_PointSize  = clamp((depth * 2.0 + edge * 1.5 + 0.3) * 120.0 / dist, 0.5, 5.0);
     }
   `,
   fragmentShader: `
+    uniform sampler2D videoTex;
     uniform float cloudOpacity;
     varying float vDepth;
     varying float vEdge;
+    varying vec2 vCorrUv;
 
     void main() {
-      if (vDepth < 0.08) discard; // hide bright background
+      // Sample real camera color at this particle's position
+      vec3 col = texture2D(videoTex, vCorrUv).rgb;
+      float luma = 0.299*col.r + 0.587*col.g + 0.114*col.b;
+      // With AdditiveBlending dark pixels add near-zero — but discard
+      // the very blackest to save overdraw on the empty background
+      if (luma < 0.04) discard;
 
       vec2 c = gl_PointCoord * 2.0 - 1.0;
       float r = dot(c, c);
       if (r > 1.0) discard;
-      float soft = 1.0 - smoothstep(0.3, 1.0, r);
+      float soft = 1.0 - smoothstep(0.2, 1.0, r);
 
-      // Deep blue body → cyan edge → white hot
-      vec3 col = mix(vec3(0.04, 0.12, 0.45), vec3(0.25, 0.75, 1.0), vDepth * 0.5 + vEdge * 0.8);
-      col = mix(col, vec3(0.92, 0.97, 1.0), clamp((vEdge - 0.5) * 2.5, 0.0, 1.0));
-
-      float alpha = soft * (vDepth * 0.3 + vEdge * 0.8) * cloudOpacity;
-      gl_FragColor = vec4(col, alpha);
+      // Edge particles get a brightness boost for silhouette glow
+      vec3 finalCol = col * (1.0 + vEdge * 1.4);
+      gl_FragColor = vec4(finalCol, soft * cloudOpacity);
     }
   `,
 });
@@ -490,12 +503,8 @@ function startGyro() {
 // ── post-processing ───────────────────────────────────────────────────────────
 const composer = new EffectComposer(renderer);
 
-const bgPass = new RenderPass(bgScene, orthoCam);
-bgPass.clearColor = new THREE.Color(0, 0, 0); bgPass.clearAlpha = 1;
-composer.addPass(bgPass);
-
 const vfxPass = new RenderPass(vfxScene, perspCam);
-vfxPass.clear = false;
+vfxPass.clearColor = new THREE.Color(0, 0, 0); vfxPass.clearAlpha = 1;
 composer.addPass(vfxPass);
 
 const bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), ctrl.bloom, 0.65, 0.40);
